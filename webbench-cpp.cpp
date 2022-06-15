@@ -19,6 +19,11 @@ volatile std::atomic_int speed(0);
 volatile std::atomic_int failed(0);
 volatile std::atomic_int bytes(0);
 
+volatile std::atomic_int failed_conn(0);
+volatile std::atomic_int failed_read(0);
+volatile std::atomic_int failed_write(0);
+volatile std::atomic_int failed_close(0);
+
 static void alarm_handler(int signal)
 {
 	timerexpired = true;
@@ -33,7 +38,7 @@ void benchcore(const Config &config)
     rlen = strlen(config.request);
     while(1)
     {
-        if(timerexpired)
+        if(timerexpired.load())
         {
             if(failed > 0)
             {
@@ -44,10 +49,12 @@ void benchcore(const Config &config)
         }
         s = Socket(config.host, config.proxyport);                          
         if(s < 0) { 
+            failed_conn++;
             failed++;
             continue;
         } 
         if(rlen != write(s, config.request, rlen)) {
+            failed_write++;
             failed++;
             close(s);
             continue;
@@ -66,11 +73,12 @@ void benchcore(const Config &config)
             /* read all available data from socket */
             while(1)
             {
-                if(timerexpired) break; 
+                if(timerexpired.load()) break; 
                 i = read(s,buf,1500);
                     /* fprintf(stderr,"%d\n",i); */
                 if(i<0) 
                 { 
+                    failed_read++;
                     failed++;
                     close(s);
                     nexttry = true;
@@ -89,6 +97,7 @@ void benchcore(const Config &config)
         }
 
         if(close(s)) {
+            failed_close++;
             failed++;
             continue;
         }
@@ -147,6 +156,10 @@ static int bench(Config config)
             (int)(bytes/(float)config.benchtime),
             speed.load(),
             failed.load());
+    printf("conn failed: %d\n", failed_conn.load());
+    printf("write failed: %d\n", failed_write.load());
+    printf("read failed: %d\n", failed_read.load());
+    printf("close failed: %d\n", failed_close.load());
     return 0;
 }
 
