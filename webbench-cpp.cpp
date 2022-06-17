@@ -5,6 +5,7 @@
 #include <strings.h>
 #include <time.h>
 #include <signal.h>
+#include <sys/epoll.h>
 
 #include <vector>
 #include <thread>
@@ -12,6 +13,8 @@
 #include <atomic>
 
 #include "./util.h"
+
+#define MAX_EVENTS 10
 
 /* values */
 volatile std::atomic_bool timerexpired(false);
@@ -24,9 +27,23 @@ volatile std::atomic_int failed_read(0);
 volatile std::atomic_int failed_write(0);
 volatile std::atomic_int failed_close(0);
 
+volatile std::atomic_int eagin_cnt(0);
+volatile std::atomic_int ebadf_cnt(0);
+volatile std::atomic_int efault_cnt(0);
+volatile std::atomic_int eintr_cnt(0);
+volatile std::atomic_int einval_cnt(0);
+volatile std::atomic_int eio_cnt(0);
+volatile std::atomic_int edir_cnt(0);
+
+volatile std::atomic_int ereset_cnt(0);
+
+int mypipe[2];
+
 static void alarm_handler(int signal)
 {
 	timerexpired = true;
+    const char* buf = "time out";
+    write(mypipe[1], buf, sizeof(buf));
 }
 
 void benchcore(const Config &config)
@@ -34,17 +51,19 @@ void benchcore(const Config &config)
     int rlen;
     char buf[1500];
     int s,i;
+    struct epoll_event ev, events[MAX_EVENTS];
+    int epfd;
 
     rlen = strlen(config.request);
     while(1)
     {
         if(timerexpired.load())
         {
-            if(failed > 0)
-            {
-                /* fprintf(stderr,"Correcting failed by signal\n"); */
-                failed--;
-            }
+            // if(failed > 0)
+            // {
+            //     /* fprintf(stderr,"Correcting failed by signal\n"); */
+            //     failed--;
+            // }
             return;
         }
         s = Socket(config.host, config.proxyport);                          
@@ -53,12 +72,61 @@ void benchcore(const Config &config)
             failed++;
             continue;
         } 
+
+        /* Code to set up listening socket, 'listen_sock',
+            (socket(), bind(), listen()) omitted */
+
+        epfd = epoll_create1(0);
+        if (epfd == -1) {
+            perror("epoll_create1");
+            exit(EXIT_FAILURE);
+        }
+
+        ev.events = EPOLLOUT | EPOLLHUP;
+        ev.data.fd = s;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, s, &ev) == -1) {
+            perror("epoll_ctl: listen_sock");
+            exit(EXIT_FAILURE);
+        }
+
+        ev.events = EPOLLIN;
+        ev.data.fd = mypipe[0];
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, mypipe[0], &ev) == -1) {
+            perror("epoll_ctl: listen_sock");
+            exit(EXIT_FAILURE);
+        }
+
+        int nfds = epoll_wait(epfd, events, MAX_EVENTS, -1);
+
+        if (nfds == -1) {
+            perror("epoll_wait");
+            exit(EXIT_FAILURE);
+        }
+
+        for(int i = 0; i < nfds; ++i){
+            int fd = events[i].data.fd;
+            if(fd == mypipe[0]){
+                return;
+            }
+        }
+
+        // 发送请求
         if(rlen != write(s, config.request, rlen)) {
             failed_write++;
             failed++;
             close(s);
             continue;
         }
+
+        // 转而开始读
+        ev.events = EPOLLIN | EPOLLHUP;
+        ev.data.fd = s;
+        if (epoll_ctl(epfd, EPOLL_CTL_MOD, s, &ev) == -1) {
+            perror("epoll_ctl: listen_sock");
+            exit(EXIT_FAILURE);
+        }
+
+
         if(config.http_version == HTTP_VERSION::HTTP_0_9){ 
             if(shutdown(s,1)) { 
                 failed++;
@@ -70,25 +138,72 @@ void benchcore(const Config &config)
         bool nexttry = false;
         if(config.force == 0) 
         {
+            bool read_end = false;
             /* read all available data from socket */
-            while(1)
+            while(!read_end)
             {
-                if(timerexpired.load()) break; 
-                i = read(s,buf,1500);
-                    /* fprintf(stderr,"%d\n",i); */
-                if(i<0) 
-                { 
-                    failed_read++;
-                    failed++;
-                    close(s);
-                    nexttry = true;
-                    break;
+                nfds = epoll_wait(epfd, events, MAX_EVENTS, -1);
+
+                if (nfds == -1) {
+                    perror("epoll_wait");
+                    return;
                 }
-                else if(i==0){ 
-                    break;
+                
+                for(int i = 0; i < nfds; ++i){
+                    int fd = events[i].data.fd;
+                    if(fd == mypipe[0]){
+                        return;
+                    }
+                    else if(fd == s){
+                        // 接收响应
+                        int ret = read(s, buf, sizeof(buf));
+                        if(ret == -1){
+                            switch (errno)
+                            {
+                            case EAGAIN:
+                                eagin_cnt++;
+                                break;
+                            case EBADF:
+                                ebadf_cnt++;
+                                break;
+                            case EFAULT:
+                                efault_cnt++;
+                                break;
+                            case EINTR:
+                                eintr_cnt++;
+                                break;
+                            case EINVAL:
+                                einval_cnt++;
+                                break;
+                            case EIO:
+                                eio_cnt++;
+                                break;
+                            case EISDIR:
+                                edir_cnt++;
+                                break;
+                            case 104:
+                                ereset_cnt++;
+                                break;
+                            default:
+                                break;
+                            }
+                            failed_read++;
+                            failed++;
+                            close(s);
+                            nexttry = true;
+                            break;
+                        }
+                        else if(ret == 0){
+                            read_end = true;
+                            break;
+                        }
+                        else{
+                            bytes += ret;
+                        }
+                    }
                 }
-                else{
-                    bytes+=i;
+                if(nexttry){
+                    break;
                 }
             }
         }
@@ -111,6 +226,11 @@ static int bench(Config config)
     int i,j,k;	
     pid_t pid=0;
     FILE *f;
+
+    if(pipe(mypipe) < 0){
+        perror("pipe error");
+        return 1;
+    }
 
     /* check avaibility of target server */
     i = Socket(config.proxyhost==NULL ? config.host : config.proxyhost, config.proxyport);
@@ -159,7 +279,15 @@ static int bench(Config config)
     printf("conn failed: %d\n", failed_conn.load());
     printf("write failed: %d\n", failed_write.load());
     printf("read failed: %d\n", failed_read.load());
-    printf("close failed: %d\n", failed_close.load());
+    printf("close failed: %d\n\n", failed_close.load());
+    printf("EGAIN: %d\n", eagin_cnt.load());
+    printf("EBADF: %d\n", ebadf_cnt.load());
+    printf("EFAULT: %d\n", efault_cnt.load());
+    printf("EINTR: %d\n", eintr_cnt.load());
+    printf("EINVAL: %d\n", einval_cnt.load());
+    printf("EIO: %d\n", eio_cnt.load());
+    printf("EISDIR: %d\n\n", edir_cnt.load());
+    printf("ERESET: %d\n", ereset_cnt.load());
     return 0;
 }
 

@@ -1,0 +1,5 @@
+make --dry-run --always-make --keep-going --print-directory
+make: Entering directory '/home/lighthouse/MyCode/linux/linux_network/webbench-cpp'
+g++ -ggdb -I ./ ./webbench-cpp.cpp ./util.cpp -lpthread -o ./webbench-cpp.out
+make: Leaving directory '/home/lighthouse/MyCode/linux/linux_network/webbench-cpp'
+ 
